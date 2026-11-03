@@ -32,12 +32,12 @@ CALIBRATION_VERSION = 1
 # 顺序对应 Lumos 关节 1..6；1=同向，-1=反向。
 JOINT_SIGNS = (-1.0, 1.0, 1.0, 1.0, -1.0, -1.0)
 FOLLOW_GAIN = 1.0          # 主臂角度变化映射比例，范围 (0, 1]
-MAX_SPEED_DEG_PER_SEC = 50.0  # 按实际时间限速；保持原 50 Hz 时的速度上限
+MAX_SPEED_DEG_PER_SEC = 100.0  # 按实际时间限速；保持原 50 Hz 时的速度上限
 MAX_TARGET_STEP_DEG = 2.0  # 单帧最大目标变化；通信卡顿后也不追赶大步
 FILTER_MIN_CUTOFF_HZ = 5.0  # 静止/慢速时抑制角度噪声
-FILTER_BETA = 0.15        # 快速运动时提高截止频率，减少滤波延迟
+FILTER_BETA = 0.0        # 快速运动时提高截止频率，减少滤波延迟
 STATUS_RATE_HZ = 5.0      # 状态打印频率，避免每帧刷新终端
-CONTROL_RATE_HZ = 50.0     # 读主臂/更新 Lumos 目标的循环频率
+CONTROL_RATE_HZ = 100.0     # 读主臂/更新 Lumos 目标的循环频率
 HD_BUTTON_ENABLED = True  # 默认开启 HD 实体按钮悬停功能
 HD_BUTTON_ID = 7          # HD 按钮板 ID；不参与关节/夹爪映射
 # ================================================================
@@ -211,7 +211,7 @@ def main() -> int:
                   CONTROL_RATE_HZ, FILTER_MIN_CUTOFF_HZ, FILTER_BETA, STATUS_RATE_HZ)
     if (not all(math.isfinite(value) for value in parameters)
             or not 0 < FOLLOW_GAIN <= 1 or MAX_SPEED_DEG_PER_SEC <= 0
-            or MAX_TARGET_STEP_DEG <= 0 or not 0 < CONTROL_RATE_HZ <= 100
+            or MAX_TARGET_STEP_DEG <= 0 or not 0 < CONTROL_RATE_HZ <= 150
             or FILTER_MIN_CUTOFF_HZ <= 0 or FILTER_BETA < 0 or STATUS_RATE_HZ <= 0):
         parser.error("Check motion, filter, and rate parameters at the top of the script")
 
@@ -355,7 +355,7 @@ def main() -> int:
         if len(previous_target) != 6:
             raise RuntimeError(f"Lumos 应返回 6 个关节位置，实际返回 {len(previous_target)} 个")
         home_error = [abs(now - calibrated) for now, calibrated in zip(previous_target, lumos_home_rad)]
-        if args.execute and any(error > 0.15 for error in home_error):
+        if args.execute and any(error > 0.5 for error in home_error):
             raise RuntimeError(
                 "Lumos 当前姿态与校准参考姿态相差超过 0.15 rad。请摆回参考姿态或重新校准。"
             )

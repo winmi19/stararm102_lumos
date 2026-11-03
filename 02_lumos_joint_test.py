@@ -1,23 +1,48 @@
 #!/usr/bin/env python3
 """Direct Lumos SDK test of go_home() and set_joint() (planned motion)."""
 import argparse
+from contextlib import contextmanager
 import math
 import os
-import sys
 import time
 from pathlib import Path
+
+
+def find_sdk_root() -> Path | None:
+    """Find the Lumos SDK config root without requiring a command-line path."""
+    script_dir = Path(__file__).resolve().parent
+    candidates = (
+        script_dir / ".dependencies" / "startouch_sdk",
+        script_dir / "startouch_sdk",
+        Path.cwd(),
+        Path.cwd() / "startouch_sdk",
+    )
+    for candidate in candidates:
+        root = candidate.expanduser().resolve()
+        if (root / "src" / "config" / "robot_kinematics.yaml").is_file():
+            return root
+    return None
+
+
+@contextmanager
+def sdk_initialization_directory(root: Path | None):
+    original = Path.cwd()
+    try:
+        if root is not None:
+            os.chdir(root)
+        yield
+    finally:
+        os.chdir(original)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--action', choices=('home', 'joint'), required=True)
     p.add_argument('--can', default='can0')
-    p.add_argument('--sdk-root', type=Path)
-    p.add_argument('--sdk-python-path', type=Path)
     p.add_argument('--delta-deg', nargs=6, type=float, default=[5, 0, 0, 0, 0, 0],
                    help='For joint: offset relative to actual current joints, degrees')
     p.add_argument('--time-sec', type=float, default=3.0)
-    p.add_argument('--max-change-deg', type=float, default=15.0,
+    p.add_argument('--max-change-deg', type=float, default=60.0,
                    help='Conservative command-change guard; user must know actual limits')
     p.add_argument('--execute', action='store_true')
     args = p.parse_args()
@@ -26,16 +51,24 @@ def main():
     if not all(math.isfinite(x) for x in args.delta_deg):
         p.error('delta-deg values must be finite')
 
-    if args.sdk_python_path:
-        sys.path.insert(0, str(args.sdk_python_path.expanduser().resolve()))
-    from startouchclass import SingleArm
-    if args.sdk_root:
-        os.chdir(args.sdk_root.expanduser().resolve())
+    sdk_root = find_sdk_root()
+    try:
+        from startouchclass import SingleArm
+    except ImportError as exc:
+        raise RuntimeError(
+            f'Cannot import Lumos Python SDK: {exc}. Install startouchclass and its dependencies '
+            'in the active Python environment.'
+        ) from exc
 
     arm = None
     try:
         print('SingleArm initialization may ENABLE motors. Keep E-stop accessible.')
-        arm = SingleArm(can_interface_=args.can, gripper=False, enable_fd_=False)
+        if sdk_root is not None:
+            print(f'Lumos SDK config: {sdk_root / "src/config/robot_kinematics.yaml"}')
+        else:
+            print('Lumos SDK config root not found in standard locations; trying current environment.')
+        with sdk_initialization_directory(sdk_root):
+            arm = SingleArm(can_interface_=args.can, gripper=False, enable_fd_=False)
         time.sleep(1.0)
         current = [float(v) for v in arm.get_joint_positions()]
         if len(current) != 6 or not all(math.isfinite(v) for v in current):
@@ -53,7 +86,7 @@ def main():
         if not args.execute:
             print('PREVIEW ONLY. Add --execute to move Lumos.')
             return
-        if input('Verify clear workspace and joint limits; type RUN: ').strip() != 'RUN':
+        if input('Verify clear workspace and joint limits; type r to execute: ').strip().lower() != 'r':
             print('Cancelled.')
             return
         if args.action == 'home':

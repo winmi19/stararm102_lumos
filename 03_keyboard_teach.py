@@ -20,9 +20,9 @@ LEADER_GRIPPER_ID = 6
 # ===================== 用户可调整的示教参数 =====================
 JOINT_SIGNS = (-1.0, 1.0, 1.0, 1.0, -1.0, -1.0)
 FOLLOW_GAIN = 1.0
-SECONDS_PER_SEGMENT = 3.0
-MAX_OFFSET_DEG = 30.0
-MAX_JUMP_DEG = 25.0
+SECONDS_PER_SEGMENT = 0.5
+MAX_OFFSET_DEG = 60.0
+MAX_JUMP_DEG = 60.0
 GRIPPER_RATE_HZ = 20.0
 CONTROL_RATE_HZ = 50.0
 HD_BUTTON_ENABLED = True
@@ -446,7 +446,7 @@ def main():
         if args.execute:
             print("EXECUTE mode: Lumos will move after each accepted teaching point." if args.mode == "step"
                   else "EXECUTE mode: Lumos will replay the recorded path.")
-            if ask("确认工作区域、限位和急停，输入 RUN 开始：").strip() != "RUN":
+            if ask("确认工作区域、限位和急停，输入 r 开始：").strip().lower() != "r":
                 print("Cancelled; no Lumos motion command sent.")
                 return
         else:
@@ -531,7 +531,7 @@ def main():
         if args.gripper:
             gripper_path = [lumos_gripper_reference] + [record["gripper_position"] for record in records]
         print("WARNING: joint mapping is an approximate relative mapping, not a calibrated kinematic conversion.")
-        if ask("检查全部目标并确认路径无碰撞，输入 REPLAY 回放：").strip() != "REPLAY":
+        if ask("检查全部目标并确认路径无碰撞，输入 y 回放：").strip().lower() != "y":
             print("Replay cancelled.")
             return
 
