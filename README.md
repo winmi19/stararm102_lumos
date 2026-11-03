@@ -1,90 +1,65 @@
-# StarArm 102 + Lumos: direct-SDK scripts
+# StarArm 102 → Lumos 直接 SDK 脚本
 
-This project keeps the original Lumos `SingleArm` SDK and directly imports the StarArm UART SDK. There is no extra integration framework or `common.py` layer.
+三个脚本直接调用原厂 SDK，不需要额外的集成框架。
 
-## Scripts
+| 脚本 | 用途 |
+| --- | --- |
+| `01_raw_teleop.py` | 校准、50 Hz 连续遥操作、滤波和限速、可选夹爪 |
+| `02_lumos_joint_test.py` | Lumos 回零与关节运动测试 |
+| `03_keyboard_teach.py` | 键盘逐点跟随、批量示教与回放、可选夹爪 |
 
-| Script | Purpose | Main Lumos API |
-| --- | --- | --- |
-| `01_raw_teleop.py` | 50 Hz raw joint servo teleoperation; optional gripper | `set_joint_raw`, `setGripperPosition` |
-| `02_lumos_joint_test.py` | Test Lumos home and planned joint motion | `go_home`, `set_joint` |
-| `03_keyboard_teach.py` | One keyboard teaching script with two replay modes and optional gripper | `set_joint`, `set_joint_waypoints`, `move_joint_waypoints_with_gripper` when supported |
+## SDK 环境
 
-## Install and SDK paths
+在同一个 Python 环境安装 `pyserial`、StarArm 的 `fashionstar_uart_sdk` 和 Lumos 的 `startouchclass` / 原生扩展。请按各 SDK 的安装说明安装，脚本直接 import，不再传 `--sdk-python-path`。
 
-Use the Python environment where the Lumos `startouch` native extension is installed. Install the supplied StarArm SDK source with:
+01 和 03 自动查找以下位置的 `src/config/robot_kinematics.yaml`：
 
-```bash
-python -m pip install -e /path/to/python-sdk
-python -m pip install pyserial numpy
-```
+1. 脚本旁 `.dependencies/startouch_sdk`
+2. 脚本旁 `startouch_sdk`
+3. 当前工作目录
+4. 当前工作目录下 `startouch_sdk`
 
-If Lumos is not already on the Python path, pass:
+SDK 位于其他位置时，只需可选参数 `--sdk-root /实际路径/startouch_sdk`。该参数指定配置根目录；Python 包仍需安装到当前环境。初始化后恢复原工作目录，保存文件相对启动目录解析。
 
-- `--sdk-root /absolute/path/to/startouch_sdk` (contains `src/config/robot_kinematics.yaml`)
-- `--sdk-python-path /absolute/path/to/interface_py` (contains `startouchclass.py`)
+02 保留原有独立测试接口，其参数可通过 `python 02_lumos_joint_test.py --help` 查看。
 
-## Keyboard teaching modes
-
-### Mode A: step-follow (leader reaches a point, keypress triggers follower)
+## 01 连续遥操作
 
 ```bash
-python 03_keyboard_teach.py --mode step --leader-port /dev/ttyUSB0 --can can0
+python 01_raw_teleop.py --calibrate
+python 01_raw_teleop.py
+python 01_raw_teleop.py --execute
 ```
 
-Move the StarArm leader to a point, type `r` and press Enter. Lumos immediately plans to that corresponding point using `set_joint()`. Repeat for each point; type `p` to print or `q` to finish. This is waypoint-triggered following, not continuous real-time following while the leader is moving.
+先校准参考姿态和主臂活动范围，再预览核对关节方向，最后执行。夹爪需在校准和运行时均加 `--gripper`，方向相反时加 `--invert-gripper`。默认串口 `/dev/ttyUSB0`、CAN `can0`，需要时用 `--leader-port`、`--can` 修改。
 
-With gripper:
+默认启用 ID 7 的 HD 按钮；无按钮板时添加 `--button-disable`。预览模式也会控制主臂悬停力矩。
+
+关节方向、跟随比例、速度、滤波和循环频率在脚本顶部修改。诊断可用 `--diagnostics-file timing.csv`。
+
+## 03 键盘示教
 
 ```bash
-python 03_keyboard_teach.py --mode step --gripper --leader-port /dev/ttyUSB0 --can can0
+python 03_keyboard_teach.py
+python 03_keyboard_teach.py --mode batch
+python 03_keyboard_teach.py --gripper --execute
+python 03_keyboard_teach.py --mode batch --gripper --execute
 ```
 
-### Mode B: batch teaching (record all leader points, then follower replays)
+默认 `step` 模式：主臂摆到一个点，输入 `r` 并按 Enter 记录；加 `--execute` 时 Lumos 规划运动到该点。输入 `p` 查看，`q` 结束。这是按键触发的逐点运动。
 
-```bash
-python 03_keyboard_teach.py --mode batch --leader-port /dev/ttyUSB0 --can can0
-```
+`batch` 模式：输入 `r` 记录、`d` 删除末点、`p` 查看、`q` 结束采集；随后连接 Lumos 并生成目标，执行模式回放整条路径。记录默认保存到启动目录下 `stararm_lumos_teach.json`，可通过 `--save` 修改。当前脚本每次重新采集，不从已有文件回放。
 
-Type `r` at each leader waypoint, `d` to delete the last point, `p` to print, and `q` to finish teaching. After teaching, place Lumos at the corresponding reference pose. The script maps all points and previews them. Add `--execute` to replay the path using one `set_joint_waypoints()` request.
+03 使用与 01 相同的 SDK 查找方式、关节方向和默认 HD 按钮行为。等待键盘输入期间也持续读取按钮。无按钮板时添加 `--button-disable`。逐点和批量运动使用 SDK 的轨迹接口，运动期间不轮询 HD 按钮；HD 按钮只控制主臂悬停，不停止 Lumos 轨迹。
 
-With gripper:
+示教参数集中在顶部：每段默认 3 秒、相对参考姿态最大偏移 30°、相邻记录点最大变化 25°，直接修改顶部常量即可。03 每次独立记录参考姿态，不读取 01 的校准文件。
 
-```bash
-python 03_keyboard_teach.py --mode batch --gripper --leader-port /dev/ttyUSB0 --can can0
-```
+批量夹爪优先使用原生同步接口；不支持时采用 Python 定时插值，其时间同步为近似值。
 
-If the installed C++ extension exposes native `move_joint_waypoints_with_gripper`, the script uses the SDK's joint+gripper waypoint API. If not, it runs a Python-timed gripper interpolation alongside the joint waypoint request; this is approximate timing, not hardware-time synchronization.
+## 操作注意
 
-### Execute real movement
-
-All scripts preview by default. Add `--execute` to request real Lumos commands. The teaching script also asks for explicit `RUN` and `REPLAY` confirmations. Example:
-
-```bash
-python 03_keyboard_teach.py --mode batch --gripper --execute \
-  --leader-port /dev/ttyUSB0 --can can0 \
-  --sdk-root /path/to/startouch_sdk \
-  --sdk-python-path /path/to/startouch_sdk/interface_py
-```
-
-If the StarArm leader is torque-held and needs to be hand-guided, add `--release-leader`. This explicitly sends the unload command to leader joints 0..5 after a second confirmation. Support the arm first; unloading torque can make it fall. The script does not automatically re-enable leader torque.
-
-## Mapping and safety
-
-The relative mapping is:
-
-```text
-target[i] = lumos_reference[i] + sign[i] * radians(leader[i] - leader_reference[i])
-```
-
-The signs `(-1, 1, 1, 1, -1, -1)` are inherited from the earlier teleoperation bridge and have not been verified as a calibrated conversion between two different robots. The default maximum leader offset is 30 degrees and maximum adjacent recorded step is 25 degrees. These are conservative software guards, not the robots' mechanical joint limits.
-
-Important:
-
-- `SingleArm(...)` may enable Lumos motors even in preview mode.
-- Confirm joint order, direction, limits, reference poses, gripper opening direction, and collision-free workspace before execution.
-- Keep the physical emergency stop accessible. Software checks are not an emergency stop.
-- `Ctrl+C` may not cancel an already-running trajectory in the Lumos controller.
-- The step mode triggers follower movement after each `r` keypress; it does not mirror the leader continuously during manual movement.
-- For batch gripper playback, the Python fallback timing is approximate if native synchronized joint+gripper playback is unavailable.
-- No real hardware execution has been verified as part of generating these scripts.
+- 默认预览，加 `--execute` 才发送 Lumos 运动命令；03 保留 RUN / REPLAY 确认。
+- `SingleArm` 初始化可能使能电机，校准和预览也一样。
+- 映射为参考姿态上的关节角增量，使用前核对关节顺序、方向、机械限位及无碰撞路径。
+- 保持硬件急停可用；Ctrl+C 可能无法取消控制器中已经启动的轨迹。
+- 尚未进行实机验证。

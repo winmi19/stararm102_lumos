@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""StarArm 102 keyboard teaching with Lumos step-follow or batch replay."""
+"""StarArm 102 → Lumos 键盘示教：逐点跟随或批量回放，支持夹爪和 HD 按钮。"""
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from typing import Sequence
+import queue
 import json
 import math
 import os
@@ -14,28 +17,127 @@ from pathlib import Path
 
 LEADER_JOINT_IDS = (0, 1, 2, 3, 4, 5)
 LEADER_GRIPPER_ID = 6
+# ===================== 用户可调整的示教参数 =====================
 JOINT_SIGNS = (-1.0, 1.0, 1.0, 1.0, -1.0, -1.0)
+FOLLOW_GAIN = 1.0
+SECONDS_PER_SEGMENT = 3.0
+MAX_OFFSET_DEG = 30.0
+MAX_JUMP_DEG = 25.0
+GRIPPER_RATE_HZ = 20.0
+CONTROL_RATE_HZ = 50.0
+HD_BUTTON_ENABLED = True
+HD_BUTTON_ID = 7
+# =============================================================
 
 
-def read_leader(bus, use_gripper: bool = False):
-    """Read six leader joints and, optionally, leader gripper servo 6."""
-    ids = list(LEADER_JOINT_IDS)
-    if use_gripper:
-        ids.append(LEADER_GRIPPER_ID)
-    feedback = bus.send_sync_servo_monitor(ids, realtime=True)
-    values = []
-    for servo_id in ids:
-        item = feedback.get(servo_id)
-        angle = None if item is None else item.angle_monitor
-        if angle is None or not math.isfinite(float(angle)):
-            raise RuntimeError(f"Missing/invalid StarArm feedback for servo {servo_id}")
-        values.append(float(angle))
+class HDButton:
+    """Match python-sdk/stararm102_ro.py: 180 degrees locks joints 0..5."""
+
+    def __init__(self, leader, button_id: int):
+        self.leader = leader
+        self.id = button_id
+        self.locked: bool | None = None
+        if not leader.ping(button_id):
+            raise RuntimeError(
+                f"HD 按钮板 ID {button_id} 未响应。请检查连接/ID；无按钮时加 --button-disable。"
+            )
+
+    def update(self) -> None:
+        angle = float(self.leader.servos[self.id].angle_monitor)
+        if not math.isfinite(angle):
+            raise RuntimeError(f"HD 按钮板 ID {self.id} 返回了无效状态")
+        locked = angle == 180.0
+        if locked == self.locked:
+            return
+        # Only affect the six arm joints; never lock the gripper or button board.
+        for servo_id in LEADER_JOINT_IDS:
+            self.leader.stop_on_control_mode(servo_id, 0x11 if locked else 0x10, 0x00)
+        self.locked = locked
+        print("\nHD 主臂：悬停锁定" if locked else "\nHD 主臂：释放，可拖动")
+
+
+def read_leader(leader, joint_map: Sequence[int], include_gripper: bool = False,
+                hd_button: HDButton | None = None) -> list[float]:
+    ids = list(joint_map)
+    if include_gripper:
+        ids.append(6)
+    monitor_ids = ids + ([hd_button.id] if hd_button is not None else [])
+    leader.send_sync_servo_monitor(monitor_ids)
+    if hd_button is not None:
+        hd_button.update()
+    values = [float(leader.servos[servo_id].angle_monitor) for servo_id in ids]
+    if not all(math.isfinite(value) for value in values):
+        raise RuntimeError("主臂返回无效角度，停止示教")
     return values
+
+
+def load_sdk():
+    try:
+        import serial
+        import fashionstar_uart_sdk as uservo
+        from startouchclass import SingleArm
+    except ImportError as exc:
+        raise RuntimeError(
+            f"缺少 Python SDK：{exc}。请在同一个 Python 环境安装 pyserial、fashionstar-uart-sdk 和 Lumos startouch_sdk。"
+        ) from exc
+    return serial, uservo, SingleArm
+
+
+def find_sdk_root(explicit: Path | None = None) -> Path | None:
+    script_dir = Path(__file__).resolve().parent
+    candidates = ([explicit] if explicit is not None else [
+        script_dir / ".dependencies" / "startouch_sdk",
+        script_dir / "startouch_sdk", Path.cwd(), Path.cwd() / "startouch_sdk",
+    ])
+    for candidate in candidates:
+        root = candidate.expanduser().resolve()
+        if (root / "src" / "config" / "robot_kinematics.yaml").is_file():
+            return root
+    if explicit is not None:
+        raise RuntimeError(f"SDK 配置不存在：{explicit}/src/config/robot_kinematics.yaml")
+    return None
+
+
+@contextmanager
+def sdk_initialization_directory(root: Path | None):
+    original = Path.cwd()
+    try:
+        if root is not None:
+            os.chdir(root)
+        yield
+    finally:
+        os.chdir(original)
+
+
+
+def prompt_with_button(prompt, bus, hd_button):
+    """等待键盘时持续读取 HD 按钮；串口只由主线程访问。"""
+    if hd_button is None:
+        return input(prompt)
+    result = queue.Queue()
+
+    def read_input():
+        try:
+            result.put((input(prompt), None))
+        except BaseException as exc:
+            result.put((None, exc))
+
+    threading.Thread(target=read_input, daemon=True).start()
+    while True:
+        try:
+            value, error = result.get(timeout=1.0 / CONTROL_RATE_HZ)
+        except queue.Empty:
+            read_leader(bus, LEADER_JOINT_IDS, hd_button=hd_button)
+            continue
+        if error is not None:
+            raise error
+        return value
+
 
 
 def map_joint_to_lumos(leader_deg, leader_ref_deg, lumos_ref_rad, max_offset_deg):
     """Map leader joint offsets (deg) onto Lumos reference joints (rad)."""
-    offsets = [JOINT_SIGNS[i] * (leader_deg[i] - leader_ref_deg[i]) for i in range(6)]
+    offsets = [JOINT_SIGNS[i] * FOLLOW_GAIN * (leader_deg[i] - leader_ref_deg[i]) for i in range(6)]
     if any(abs(value) > max_offset_deg for value in offsets):
         raise ValueError(
             f"Leader offset exceeds {max_offset_deg:.1f} deg: "
@@ -74,15 +176,6 @@ def check_lumos_path(reference, targets, max_jump_deg):
         previous = target
 
 
-def load_lumos(args):
-    if args.sdk_python_path:
-        sys.path.insert(0, str(args.sdk_python_path.expanduser().resolve()))
-    if args.sdk_root:
-        os.chdir(args.sdk_root.expanduser().resolve())
-    from startouchclass import SingleArm
-    # The SDK constructor may enable the real Lumos motors, including preview runs.
-    return SingleArm(can_interface_=args.can, gripper=args.gripper, enable_fd_=False)
-
 
 def save_json(path: Path, data):
     path = path.expanduser().resolve()
@@ -99,7 +192,7 @@ def validate_six(values, label):
 
 def print_points(records):
     if not records:
-        print("No teaching points recorded.")
+        print("尚无示教点。")
         return
     for index, record in enumerate(records, 1):
         grip = record.get("gripper_position")
@@ -201,30 +294,39 @@ def main():
     parser.add_argument("--can", default="can0")
     parser.add_argument("--sdk-root", type=Path,
                         help="Lumos SDK root containing src/config/robot_kinematics.yaml")
-    parser.add_argument("--sdk-python-path", type=Path,
-                        help="Directory containing startouchclass.py")
     parser.add_argument("--gripper", action="store_true",
                         help="Also teach StarArm servo 6 and control the Lumos gripper")
     parser.add_argument("--invert-gripper", action="store_true",
                         help="Invert the leader-to-Lumos gripper opening direction")
-    parser.add_argument("--release-leader", action="store_true",
-                        help="Explicitly unload leader joints 0..5 for hand-guiding")
-    parser.add_argument("--seconds-per-segment", type=float, default=3.0)
-    parser.add_argument("--max-offset-deg", type=float, default=30.0)
-    parser.add_argument("--max-jump-deg", type=float, default=25.0)
-    parser.add_argument("--gripper-rate-hz", type=float, default=20.0,
-                        help="Python fallback gripper interpolation rate in batch mode")
+    buttons = parser.add_mutually_exclusive_group()
+    buttons.add_argument("--button-enable", action="store_true", dest="button_enabled")
+    buttons.add_argument("--button-disable", action="store_false", dest="button_enabled",
+                         help="无 HD 按钮板时关闭按钮功能")
+    parser.set_defaults(button_enabled=HD_BUTTON_ENABLED)
+    parser.add_argument("--button-id", type=int, choices=range(7, 254), default=HD_BUTTON_ID, metavar="ID")
+    parser.set_defaults(seconds_per_segment=SECONDS_PER_SEGMENT,
+                        max_offset_deg=MAX_OFFSET_DEG, max_jump_deg=MAX_JUMP_DEG,
+                        gripper_rate_hz=GRIPPER_RATE_HZ)
     parser.add_argument("--save", type=Path, default=Path("stararm_lumos_teach.json"))
     parser.add_argument("--execute", action="store_true",
                         help="Actually command Lumos; without it, only preview targets")
     args = parser.parse_args()
+    args.save = args.save.expanduser().resolve()
+    if len(JOINT_SIGNS) != 6 or any(sign not in (-1.0, 1.0) for sign in JOINT_SIGNS):
+        parser.error("JOINT_SIGNS 必须包含六个 1.0 或 -1.0")
 
-    if (args.seconds_per_segment <= 0 or args.max_offset_deg <= 0
-            or args.max_jump_deg <= 0 or args.gripper_rate_hz <= 0):
+    parameters = (args.seconds_per_segment, args.max_offset_deg,
+                  args.max_jump_deg, args.gripper_rate_hz, FOLLOW_GAIN, CONTROL_RATE_HZ)
+    if (not all(math.isfinite(value) and value > 0 for value in parameters)
+            or FOLLOW_GAIN > 1 or CONTROL_RATE_HZ > 100):
         parser.error("time, safety limits, and gripper rate must be positive")
 
-    import serial
-    import fashionstar_uart_sdk as uservo
+    try:
+        sdk_root = find_sdk_root(args.sdk_root)
+        serial, uservo, SingleArm = load_sdk()
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
+        return 2
 
     uart = None
     arm = None
@@ -244,39 +346,39 @@ def main():
         uart = serial.Serial(args.leader_port, baudrate=1_000_000, timeout=0)
         bus = uservo.UartServoManager(uart)
 
-        if args.release_leader:
-            print("WARNING: unloading leader torque can make the arm fall. Support it first.")
-            if input("Type RELEASE to unload StarArm joints 0..5: ").strip() == "RELEASE":
-                for servo_id in LEADER_JOINT_IDS:
-                    bus.stop_on_control_mode(servo_id, 0x10, 0x00)
-            else:
-                print("Leader torque was not released.")
+        hd_button = HDButton(bus, args.button_id) if args.button_enabled else None
+        if hd_button is not None:
+            print(f"HD 按钮功能已开启（ID={hd_button.id}）；预览模式也控制主臂悬停。")
+            read_leader(bus, LEADER_JOINT_IDS, hd_button=hd_button)
+
+        def ask(prompt):
+            return prompt_with_button(prompt, bus, hd_button)
 
         gripper_closed = None
         gripper_opened = None
         if args.gripper:
-            input("Move StarArm gripper to FULLY CLOSED, then press Enter...")
-            gripper_closed = read_leader(bus, use_gripper=True)[-1]
-            input("Move StarArm gripper to FULLY OPEN, then press Enter...")
-            gripper_opened = read_leader(bus, use_gripper=True)[-1]
+            ask("将 StarArm 夹爪完全闭合，按 Enter 记录……")
+            gripper_closed = read_leader(bus, LEADER_JOINT_IDS, True, hd_button)[-1]
+            ask("将 StarArm 夹爪完全打开，按 Enter 记录……")
+            gripper_opened = read_leader(bus, LEADER_JOINT_IDS, True, hd_button)[-1]
             if abs(gripper_opened - gripper_closed) < 2.0:
                 raise RuntimeError("StarArm gripper calibration span is less than 2 degrees")
             print(f"Leader gripper calibration: closed={gripper_closed:.1f}, open={gripper_opened:.1f} deg")
 
-        input("Place StarArm at its neutral/reference pose, then press Enter...")
-        leader_reference = read_leader(bus)[:6]
+        ask("将 StarArm 摆到遥操作参考姿态，按 Enter 记录……")
+        leader_reference = read_leader(bus, LEADER_JOINT_IDS, hd_button=hd_button)[:6]
         data["leader_reference_deg"] = leader_reference
         data["leader_gripper_closed_deg"] = gripper_closed
         data["leader_gripper_open_deg"] = gripper_opened
         print("Leader reference (deg):", [round(value, 2) for value in leader_reference])
 
         if args.mode == "batch":
-            print("\nBATCH MODE: move the leader freely between points; follower will replay after teaching ends.")
-            print("Commands: r=record, d=delete last, p=print points, q=finish teaching")
+            print("\n批量示教：移动主臂记录多个点，示教结束后回放。")
+            print("命令：r=记录，d=删除末点，p=查看，q=结束示教（输入后按 Enter）")
             while True:
-                command = input("teach> ").strip().lower()
+                command = ask("teach> ").strip().lower()
                 if command == "r":
-                    sample = read_leader(bus, use_gripper=args.gripper)
+                    sample = read_leader(bus, LEADER_JOINT_IDS, args.gripper, hd_button)
                     leader_joints = sample[:6]
                     previous = records[-1]["leader_joints_deg"] if records else leader_reference
                     try:
@@ -301,30 +403,33 @@ def main():
                         save_json(save_path, data)
                         print("Deleted last point:", [round(value, 1) for value in removed["leader_joints_deg"]])
                     else:
-                        print("No point to delete.")
+                        print("没有可删除的示教点。")
                 elif command == "p":
                     print_points(records)
                 elif command == "q":
                     break
                 else:
-                    print("Use r / d / p / q")
+                    print("请输入 r / d / p / q")
         else:
-            print("\nSTEP MODE: move leader to a waypoint, then press r; Lumos follows that point immediately.")
-            print("Commands: r=record and follow, p=print points, q=finish")
+            print("\n逐点示教：主臂摆到目标点后输入 r；执行模式下 Lumos 跟随到该点。")
+            print("命令：r=记录并跟随，p=查看，q=结束")
 
         if args.mode == "batch" and not records:
-            print("No teaching points recorded; exiting.")
+            print("没有记录示教点，退出。")
             return
 
         if args.mode == "batch":
-            print("\nLeader teaching is finished. Move Lumos to the desired corresponding reference pose.")
-            input("Check workspace and E-stop; press Enter to initialize Lumos...")
+            print("\n主臂示教结束，请将 Lumos 摆到对应的参考姿态。")
+            ask("确认工作区域和急停，按 Enter 连接 Lumos……")
         else:
-            print("\nSTEP MODE: align Lumos to the corresponding reference pose before starting.")
-            input("Check workspace and E-stop; press Enter to initialize Lumos...")
+            print("\n逐点示教：开始前请将 Lumos 摆到对应的参考姿态。")
+            ask("确认工作区域和急停，按 Enter 连接 Lumos……")
 
-        print("WARNING: SingleArm initialization may enable Lumos motors, even in preview mode.")
-        arm = load_lumos(args)
+        print("Lumos 连接时可能使能电机，预览模式也一样；请确认急停可用。")
+        if sdk_root is not None:
+            print(f"Lumos SDK 配置：{sdk_root / 'src/config/robot_kinematics.yaml'}")
+        with sdk_initialization_directory(sdk_root):
+            arm = SingleArm(can_interface_=args.can, gripper=args.gripper, enable_fd_=False)
         time.sleep(1.0)
         lumos_reference = validate_six(arm.get_joint_positions(), "Lumos joint feedback")
         data["lumos_reference_rad"] = lumos_reference
@@ -341,20 +446,20 @@ def main():
         if args.execute:
             print("EXECUTE mode: Lumos will move after each accepted teaching point." if args.mode == "step"
                   else "EXECUTE mode: Lumos will replay the recorded path.")
-            if input("Clear workspace, verify limits and E-stop; type RUN: ").strip() != "RUN":
+            if ask("确认工作区域、限位和急停，输入 RUN 开始：").strip() != "RUN":
                 print("Cancelled; no Lumos motion command sent.")
                 return
         else:
-            print("PREVIEW mode: no Lumos motion commands will be sent (controller initialization may still enable motors).")
+            print("预览模式：只显示目标，不发送 Lumos 运动命令（连接仍可能使能电机）。")
 
         if args.mode == "step":
-            print("\nCommands: r=record current leader pose and trigger follower, p=print, q=finish")
+            print("\n命令：r=记录当前主臂姿态并触发跟随，p=查看，q=结束")
             previous_leader = leader_reference
             expected_lumos = lumos_reference[:]
             while True:
-                command = input("step> ").strip().lower()
+                command = ask("step> ").strip().lower()
                 if command == "r":
-                    sample = read_leader(bus, use_gripper=args.gripper)
+                    sample = read_leader(bus, LEADER_JOINT_IDS, args.gripper, hd_button)
                     leader_joints = sample[:6]
                     try:
                         map_joint_to_lumos(leader_joints, leader_reference, lumos_reference,
@@ -398,7 +503,7 @@ def main():
                 elif command == "q":
                     break
                 else:
-                    print("Use r / p / q")
+                    print("请输入 r / p / q")
             print("Step teaching finished. Saved:", save_path)
             return
 
@@ -426,7 +531,7 @@ def main():
         if args.gripper:
             gripper_path = [lumos_gripper_reference] + [record["gripper_position"] for record in records]
         print("WARNING: joint mapping is an approximate relative mapping, not a calibrated kinematic conversion.")
-        if input("Inspect every target and confirm the physical path is collision-free; type REPLAY: ").strip() != "REPLAY":
+        if ask("检查全部目标并确认路径无碰撞，输入 REPLAY 回放：").strip() != "REPLAY":
             print("Replay cancelled.")
             return
 
@@ -445,16 +550,19 @@ def main():
             print(f"Final gripper feedback={actual_gripper:.3f}; target={gripper_path[-1]:.3f}")
 
     except KeyboardInterrupt:
-        print("\nStopped by keyboard. An already-running Lumos trajectory may continue.")
+        print("\n键盘停止。Lumos 控制器中已启动的轨迹可能继续执行。")
     except Exception as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
-        raise
+        return 1
     finally:
         if arm is not None:
-            arm.cleanup()
+            try:
+                arm.cleanup()
+            except Exception as exc:
+                print(f"Lumos cleanup warning: {exc}", file=sys.stderr)
         if uart is not None and uart.is_open:
             uart.close()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
